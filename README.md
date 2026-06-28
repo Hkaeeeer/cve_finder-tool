@@ -24,7 +24,8 @@ pip install requests rich
 ```
 
 ## Usage
-![CVE-Hunter](154042.png)
+![CVE-Hunter](Screenshot%202026-06-28%20154141.png)
+![CVE-Hunter](Screenshot%202026-06-28%20154142.png)
 **The basics — check a CVE and see its priority:**
 ```bash
 python cve_hunter.py scan CVE-2021-44228
