@@ -115,12 +115,6 @@ python cve_hunter.py config set-key --github-token YOUR_TOKEN   # better PoC loo
 
 An NVD key is free and strongly recommended — without one you ride the public rate limit (~6 seconds per scan). Vulners, Shodan and GreyNoise keys unlock additional enrichment: `python cve_hunter.py config set-key --help`.
 
-## Development
-
-```bash
-python3 tests/test_fixes.py    # regression checks — plain asserts, no pytest needed
-```
-
 ## What this tool is (and isn't)
 
 CVE-Hunter is a **triage and ranking** tool. It compresses hours of initial analysis into seconds and tells you where to start — but the final call (is the target actually vulnerable, does the exploit actually work) is yours to confirm hands-on. The output is only as good as the sources: if NVD is missing a CWE for a vuln, CVE-Hunter will be missing it too.
