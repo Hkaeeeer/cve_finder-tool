@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# CVE-Hunter runtime artifacts
+cve_hunter_results.json
+cve_hunter_results.csv
+cve_hunter_results.md
+.cve-hunter/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
