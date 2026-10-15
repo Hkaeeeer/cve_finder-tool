@@ -26,6 +26,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 from configparser import ConfigParser
 from contextlib import closing
@@ -1069,12 +1070,18 @@ class NVDClient:
         if settings.nvd_api_key:
             self.session.headers["apiKey"] = settings.nvd_api_key
         self._last_ts = 0.0
+        # FIX (bug-3): rate-limit state is shared and mutated from multiple
+        # batch/enrichment threads. Without a lock, concurrent workers all
+        # sleep the same interval and then hit the API simultaneously —
+        # defeating the limiter and eating 403/429 backoffs.
+        self._rl_lock = threading.Lock()
 
     def _rate_limit(self) -> None:
-        elapsed = time.time() - self._last_ts
-        wait = self.s.nvd_request_interval - elapsed
-        if wait > 0: time.sleep(wait)
-        self._last_ts = time.time()
+        with self._rl_lock:
+            elapsed = time.time() - self._last_ts
+            wait = self.s.nvd_request_interval - elapsed
+            if wait > 0: time.sleep(wait)
+            self._last_ts = time.time()
 
     def _get(self, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Fetch from NVD with exponential backoff on failures.
@@ -1329,11 +1336,13 @@ class EPSSClient:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "CVE-Hunter/4.0", "Accept": "application/json"})
         self._last_ts = 0.0
+        self._rl_lock = threading.Lock()  # FIX (bug-3): thread-safe rate limit
 
     def _rate_limit(self) -> None:
-        elapsed = time.time() - self._last_ts
-        if elapsed < 1.0: time.sleep(1.0 - elapsed)
-        self._last_ts = time.time()
+        with self._rl_lock:  # FIX (bug-3)
+            elapsed = time.time() - self._last_ts
+            if elapsed < 1.0: time.sleep(1.0 - elapsed)
+            self._last_ts = time.time()
 
     def get(self, cve_id: str) -> Tuple[Optional[Dict[str, Any]], str]:
         """Returns (data, status). data is None when not found or unavailable."""
@@ -1561,12 +1570,14 @@ class PoCInGitHubSearcher:
         if github_token:
             self.session.headers["Authorization"] = f"Bearer {github_token}"
         self._last_ts = 0.0
+        self._rl_lock = threading.Lock()  # FIX (bug-3): thread-safe rate limit
 
     def _rate_limit(self) -> None:
-        elapsed = time.time() - self._last_ts
-        wait = 7.0 if not self.session.headers.get("Authorization") else 1.0
-        if elapsed < wait: time.sleep(wait - elapsed)
-        self._last_ts = time.time()
+        with self._rl_lock:  # FIX (bug-3)
+            elapsed = time.time() - self._last_ts
+            wait = 7.0 if not self.session.headers.get("Authorization") else 1.0
+            if elapsed < wait: time.sleep(wait - elapsed)
+            self._last_ts = time.time()
 
     @staticmethod
     def _normalize_repo(raw: Dict[str, Any], provenance: str) -> Dict[str, Any]:
@@ -2050,12 +2061,14 @@ class GitHubAdvisoryClient:
             self.session.headers["Authorization"] = f"Bearer {github_token}"
         self._has_token = bool(github_token)
         self._last_ts = 0.0
+        self._rl_lock = threading.Lock()  # FIX (bug-3): thread-safe rate limit
 
     def _rate_limit(self) -> None:
-        elapsed = time.time() - self._last_ts
-        wait = 1.0 if self._has_token else 7.0
-        if elapsed < wait: time.sleep(wait - elapsed)
-        self._last_ts = time.time()
+        with self._rl_lock:  # FIX (bug-3)
+            elapsed = time.time() - self._last_ts
+            wait = 1.0 if self._has_token else 7.0
+            if elapsed < wait: time.sleep(wait - elapsed)
+            self._last_ts = time.time()
 
     def fetch(self, cve_id: str) -> Tuple[List[Dict[str, Any]], str]:
         """Returns (advisories, status)."""
@@ -3049,6 +3062,30 @@ class MSFModuleSearcher:
 # ════════════════════════════════════════════════════════════════════════════
 # Composite Risk Score (NEW in v3.1) — single number for prioritization
 # ════════════════════════════════════════════════════════════════════════════
+def _pr_ui_factors(vector: str) -> Tuple[float, float, str, str]:
+    """PR and UI accessibility factors from a CVSS vector string.
+
+    FIX (bug-6): handles both v3/v4 (PR:/UI:) and v2 (Au:) vectors. v2 has
+    no PR:/UI: metrics — the old code silently applied 0.9 defaults, which
+    under-rated every v2-only CVE by ~19% in accessibility. For v2, Au:N/L/H
+    maps onto the PR factors and UI is 1.0 (v2 has no user-interaction
+    metric). Returns (pr_factor, ui_factor, pr_desc, ui_desc); the *_desc
+    strings feed the risk breakdown so the mapping stays transparent.
+    """
+    m_pr = re.search(r"PR:([NLH])", vector)
+    m_ui = re.search(r"UI:([NR])", vector)
+    if m_pr is None and "Au:" in vector:
+        m_au = re.search(r"Au:([NLH])", vector)
+        au = m_au.group(1) if m_au else ""
+        pr_factor = {"N": 1.0, "L": 0.9, "H": 0.5}.get(au, 0.9)
+        return pr_factor, 1.0, f"PR(=Au:{au or '?'})={pr_factor}", "UI=n/a (v2)=1.0"
+    pr_factor = {"N": 1.0, "L": 0.9, "H": 0.5}.get(m_pr.group(1) if m_pr else "", 0.9)
+    ui_factor = {"N": 1.0, "R": 0.8}.get(m_ui.group(1) if m_ui else "", 0.9)
+    return (pr_factor, ui_factor,
+            f"PR={m_pr.group(1) if m_pr else '?'}={pr_factor}",
+            f"UI={m_ui.group(1) if m_ui else '?'}={ui_factor}")
+
+
 def compute_risk_score(result: "CVERecord") -> Risk:
     """Compute a dimensional, confidence-weighted risk score (Phase 2).
 
@@ -3084,6 +3121,8 @@ def compute_risk_score(result: "CVERecord") -> Risk:
         AV:N=1.0  AV:A=0.7  AV:L=0.3  AV:P=0.1  (or 0.6 if unknown)
         PR:N=1.0  PR:L=0.9  PR:H=0.5  (multiply)
         UI:N=1.0  UI:R=0.8             (multiply)
+        (CVSS v2 vectors: Au:N/L/H maps onto the PR factors; UI has no
+         v2 equivalent and is treated as 1.0 — see _pr_ui_factors.)
       confidence_factor:
         high=1.0   medium=0.8   low=0.5
     """
@@ -3162,17 +3201,16 @@ def compute_risk_score(result: "CVERecord") -> Risk:
     vector = cvss.vector if cvss else ""
     av = extract_attack_vector(vector)
     av_factor = {"N": 1.0, "A": 0.7, "L": 0.3, "P": 0.1}.get(av or "", 0.6)
-    m_pr = re.search(r"PR:([NLH])", vector)
-    pr_factor = {"N": 1.0, "L": 0.9, "H": 0.5}.get(m_pr.group(1) if m_pr else "", 0.9)
-    m_ui = re.search(r"UI:([NR])", vector)
-    ui_factor = {"N": 1.0, "R": 0.8}.get(m_ui.group(1) if m_ui else "", 0.9)
+    # FIX (bug-6): CVSS v2 vectors have no PR:/UI: metrics (they use Au:).
+    # _pr_ui_factors() handles both formats instead of silently defaulting.
+    pr_factor, ui_factor, pr_desc, ui_desc = _pr_ui_factors(vector)
     raw_access = av_factor * pr_factor * ui_factor
     accessibility = 0.5 + 0.5 * raw_access
     breakdown.append(
         f"accessibility={accessibility:.2f} (remapped from raw={raw_access:.2f}: "
         f"AV={av or '?'}={av_factor}, "
-        f"PR={m_pr.group(1) if m_pr else '?'}={pr_factor}, "
-        f"UI={m_ui.group(1) if m_ui else '?'}={ui_factor})"
+        f"{pr_desc}, "
+        f"{ui_desc})"
     )
 
     # ---- confidence factor ----
@@ -3297,6 +3335,13 @@ def _parse_version(v: str) -> Tuple[int, ...]:
     # "9.0.0.M1"  → "9.0.0" → (9, 0, 0)
     # "2.14.0"    → "2.14.0" → (2, 14, 0)  (unchanged)
     v = v.strip()
+    # FIX (bug-5 cont.): accept a single leading "v" as decoration ("v2.14.1"),
+    # so _parse_version and _version_has_suffix agree that "v1.0" is a valid,
+    # suffix-free version. The old author comment ("Allow whitespace and
+    # leading 'v' as non-suffix decoration") intended this, but _parse_version
+    # never implemented it — it cut at the "v" and returned ().
+    if v[:1].lower() == "v":
+        v = v[1:]
     # Find the first character that is NOT a digit or dot, and cut there.
     cut_at = len(v)
     for i, ch in enumerate(v):
@@ -3324,10 +3369,15 @@ def _version_has_suffix(v: str) -> bool:
     guessing wrong and silently producing a false affected/not-affected.
     """
     if not v or not isinstance(v, str): return False
+    # FIX (bug-5): strip only a LEADING "v" decoration ("v1.0"). The old
+    # code did stripped.replace("v", "") which removed EVERY "v", so
+    # "1.0v2" was misclassified as suffix-free and then silently compared
+    # as (1, 0) — producing wrong affected/not-affected verdicts.
+    s = v.strip().lower()
+    if s.startswith("v"):
+        s = s[1:]
     # After stripping digits and dots, if anything non-trivial remains → suffix
-    stripped = re.sub(r"[0-9.]+", "", v.strip().lower())
-    # Allow whitespace and leading "v" as non-suffix decoration
-    stripped = stripped.replace("v", "").strip()
+    stripped = re.sub(r"[0-9.]+", "", s)
     return bool(stripped)
 
 
@@ -5642,6 +5692,20 @@ def export_json(results, path: Path) -> Path:
     return path
 
 
+def _csv_safe(value: Any) -> Any:
+    """Neutralize CSV formula injection (CWE-1236) in exported cells.
+
+    NVD descriptions and product names are third-party data. If a cell
+    starts with =, +, -, @ (or tab/CR), Excel & co. would evaluate it as a
+    formula when the file is opened — a real attack vector for a security
+    tool whose output gets shared. Prefixing with a single quote renders
+    the cell inert text. Non-string values (ints/floats/None) pass through.
+    """
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + value
+    return value
+
+
 def export_csv(results, path: Path) -> Path:
     results = [r.to_dict() if hasattr(r, "to_dict") else r for r in results]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -5698,7 +5762,9 @@ def export_csv(results, path: Path) -> Path:
             row["vulncheck_kev"] = "YES" if r.get("vulncheck_kev") else "NO"
             row["nuclei_template"] = "YES" if r.get("nuclei_template") else "NO"
             row["version_match"] = ""  # filled only when --check-version was used
-            row["cwes"] = " | ".join(r.get("cwes", []))
+            # FIX (bug-7): removed dead `row["cwes"]` assignment — "cwes" was
+            # never in the headers list, so extrasaction="ignore" always
+            # dropped it. cwe_chain covers the same information.
             row["affected_products"] = " | ".join(
                 vr.get("human", vr.get("cpe", ""))
                 for vr in r.get("version_ranges", [])[:5]
@@ -5722,13 +5788,17 @@ def export_csv(results, path: Path) -> Path:
                                           else "Unknown")
             row["vector_conflict"] = "YES" if r.get("vector_category_conflict") else "NO"
             row["sources_status"] = json.dumps(r.get("sources_status", {}))
+            # FIX (bug-4): sanitize every cell — formula-injection hardening.
+            row = {k: _csv_safe(v) for k, v in row.items()}
             w.writerow(row)
     return path
 
 
 def export_markdown(results, path: Path) -> Path:
     """Phase 4: Markdown report — paste-ready finding blocks for Obsidian."""
-    results = [r if hasattr(r, "to_dict") else r for r in results]
+    # FIX (bug-8): removed a no-op comprehension — it returned `r` in BOTH
+    # branches. This function expects CVERecord objects (attribute access
+    # below), same as _print_summary/_print_plain.
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = ["# CVE-Hunter Report", ""]
     for r in results:
@@ -5957,7 +6027,7 @@ def cmd_batch(args, settings: Settings) -> int:
     # re-fetching. One slow/failed CVE never blocks or aborts the set.
     max_workers = min(settings.discovery_workers, max(1, len(cve_ids)))
     results: List[CVERecord] = []
-    results_lock = __import__("threading").Lock()
+    results_lock = threading.Lock()  # FIX: use the top-level import
     failed: List[Tuple[str, str]] = []
 
     def _enrich_one_safe(cid: str) -> None:
@@ -6045,6 +6115,19 @@ def cmd_search(args, settings: Settings) -> int:
                 f"[yellow]⚠ '{kw}' looks like a CVE ID.[/yellow] "
                 f"[dim]Auto-redirecting to `scan` (NVD keyword search does not match CVE IDs).[/dim]"
             )
+            # FIX (bug-1): the `search` namespace lacks the scan-only
+            # attributes (no_github, verbose, ...). Without filling them,
+            # the redirect crashed with:
+            #   AttributeError: 'Namespace' object has no attribute 'no_github'
+            for _attr, _default in (
+                ("no_github", False), ("no_local", False),
+                ("use_msf", getattr(args, "use_msf", False)),
+                ("no_kev", False), ("verbose", False),
+                ("exploit", False), ("report", False),
+                ("check_version", None),
+            ):
+                if not hasattr(args, _attr):
+                    setattr(args, _attr, _default)
             args.cve_id = kw
             return cmd_scan(args, settings)
     debug = DebugLog() if args.debug else None
@@ -6070,22 +6153,27 @@ def cmd_search(args, settings: Settings) -> int:
                                 max_pocs=max_pocs)
         prog.update(task, completed=1)
     if not results:
-        console.print("[yellow]No results found.[/yellow]")
-        # Helpful diagnostic: explain the likely causes so the user knows
-        # what to do next. NVD's keyword search silently returns 0 results
-        # when rate-limited (no error, just empty list), which is confusing.
-        console.print()
-        console.print("[dim]Possible causes:[/dim]")
-        console.print("[dim]  • NVD rate limit hit (5 requests/30s without API key)[/dim]")
-        console.print("[dim]  • Keyword too short or doesn't match any CVE description[/dim]")
-        console.print("[dim]  • NVD's keyword search only searches CVE descriptions, not CVE IDs[/dim]")
-        console.print()
-        console.print("[dim]Tips:[/dim]")
-        console.print("[dim]  • If you have a CVE ID, use:  cve-hunter scan CVE-2021-44228[/dim]")
-        console.print("[dim]  • Wait 30s and retry (NVD rate limit resets)[/dim]")
-        console.print("[dim]  • Get a free NVD API key for higher rate limits:[/dim]")
-        console.print("[dim]    https://nvd.nist.gov/developers/request-an-api-key[/dim]")
-        console.print("[dim]  • Use --debug to see per-source HTTP status[/dim]")
+        # FIX (bug-2): respect -q/--plain — one clean line instead of rich
+        # markup, so the output stays pipe-friendly.
+        if is_plain:
+            print("No results found.")
+        else:
+            console.print("[yellow]No results found.[/yellow]")
+            # Helpful diagnostic: explain the likely causes so the user knows
+            # what to do next. NVD's keyword search silently returns 0 results
+            # when rate-limited (no error, just empty list), which is confusing.
+            console.print()
+            console.print("[dim]Possible causes:[/dim]")
+            console.print("[dim]  • NVD rate limit hit (5 requests/30s without API key)[/dim]")
+            console.print("[dim]  • Keyword too short or doesn't match any CVE description[/dim]")
+            console.print("[dim]  • NVD's keyword search only searches CVE descriptions, not CVE IDs[/dim]")
+            console.print()
+            console.print("[dim]Tips:[/dim]")
+            console.print("[dim]  • If you have a CVE ID, use:  cve-hunter scan CVE-2021-44228[/dim]")
+            console.print("[dim]  • Wait 30s and retry (NVD rate limit resets)[/dim]")
+            console.print("[dim]  • Get a free NVD API key for higher rate limits:[/dim]")
+            console.print("[dim]    https://nvd.nist.gov/developers/request-an-api-key[/dim]")
+            console.print("[dim]  • Use --debug to see per-source HTTP status[/dim]")
         if debug: debug.dump(console)
         return 0
     # Phase 4 PART C3: ranked summary — when --deep was used, the summary
@@ -6097,7 +6185,12 @@ def cmd_search(args, settings: Settings) -> int:
         if shallow_count > 0:
             console.print(f"[dim]Deep-enriched: {deep_count} CVE(s); "
                           f"shallow (past --deep-limit): {shallow_count} CVE(s).[/dim]")
-    _print_summary(results)
+    # FIX (bug-2): -q/--plain now uses the pipe-friendly one-line format
+    # (same as scan/batch) instead of always printing the rich summary table.
+    if is_plain:
+        _print_plain(results)
+    else:
+        _print_summary(results)
     if debug: debug.dump(console)
     if args.export:
         _export(results, args.export, settings)
